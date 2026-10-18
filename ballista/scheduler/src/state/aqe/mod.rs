@@ -171,7 +171,7 @@ impl AdaptiveExecutionGraph {
         let stages: ballista_core::error::Result<HashMap<usize, ExecutionStage>> =
             runnable
                 .into_iter()
-                .map(|s| Self::create_resolved_stage(session_config.clone(), s))
+                .map(|s| Self::create_resolved_stage(session_config.clone(), s, 0))
                 .collect();
         let stages = stages?;
 
@@ -207,11 +207,12 @@ impl AdaptiveExecutionGraph {
     fn create_resolved_stage(
         session_config: Arc<SessionConfig>,
         stage: AdaptiveStageInfo,
+        stage_attempt_num: usize,
     ) -> ballista_core::error::Result<(usize, ExecutionStage)> {
         let stage_id = stage.plan.stage_id();
         let stage = ExecutionStage::Resolved(ResolvedStage::new(
             stage_id,
-            0,
+            stage_attempt_num,
             stage.plan,
             vec![], // we do not know output links at this moment
             stage.inputs,
@@ -256,7 +257,21 @@ impl AdaptiveExecutionGraph {
             }
 
             for stage_id in updated_stages.resubmit_successful_stages {
-                self.rerun_successful_stage(stage_id);
+                if !self.rerun_successful_stage(stage_id) {
+                    // The re-open failed and failed the job with the
+                    // retryable executor-loss marker (M7.4) — surface it so
+                    // the client learns the job is done instead of waiting
+                    // for the statement timeout.
+                    if let Some(job_status::Status::Failed(failed)) = &self.status.status
+                    {
+                        events.push(QueryStageSchedulerEvent::JobRunningFailed {
+                            job_id: job_id.clone(),
+                            fail_message: failed.error.clone(),
+                            queued_at: self.queued_at,
+                            failed_at: timestamp_millis(),
+                        });
+                    }
+                }
             }
 
             if !running_tasks_to_cancel.is_empty() {
@@ -492,10 +507,27 @@ impl AdaptiveExecutionGraph {
                 //
                 // TODO: mark stage as running to avoid returning it back
                 for stage in runnable_stages {
-                    if !self.stages.contains_key(&stage.plan.stage_id()) {
+                    let stage_id = stage.plan.stage_id();
+                    // A stage rolled back to UnResolved by executor-loss
+                    // recovery is re-created here once its producer
+                    // re-finalises (M7.4) — the fresh ResolvedStage carries
+                    // the rolled-back attempt number and inputs built over
+                    // the producer's re-run output. Running/Successful/
+                    // Resolved entries are left untouched.
+                    let replaceable = matches!(
+                        self.stages.get(&stage_id),
+                        None | Some(ExecutionStage::UnResolved(_))
+                    );
+                    if replaceable {
+                        let attempt = self
+                            .stages
+                            .get(&stage_id)
+                            .map(|existing| existing.stage_attempt_num())
+                            .unwrap_or(0);
                         let (stage_id, stage) = Self::create_resolved_stage(
                             self.session_config.clone(),
                             stage,
+                            attempt,
                         )?;
                         self.stages.insert(stage_id, stage);
                     }
@@ -663,25 +695,33 @@ impl AdaptiveExecutionGraph {
             all_running_tasks.extend(tasks);
         }
 
-        // Adaptive planning finalises a stage on first completion and cannot
-        // re-open it (M7.4). Rolling a downstream stage back, or re-running a
-        // successful producer, leaves the job unable to make progress — fail
-        // it with a distinguishable message so the client can resubmit once,
-        // instead of hanging until the statement timeout. In-flight-only loss
-        // (tasks reset inside a still-running stage, no rollback) still
-        // recovers here.
-        let needs_finalised_rerun = !resubmit_successful_stages.is_empty()
-            || !rollback_running_stages.is_empty()
-            || !rollback_resolved_stages.is_empty();
-        if needs_finalised_rerun {
-            let msg = format!(
-                "{} (job {job_id}, executor {executor_id})",
-                ballista_core::AQE_EXECUTOR_LOSS_MARKER
+        // M7.4 phase 2 — re-run finalised producers in place instead of
+        // failing the job. A successful producer whose own inputs are
+        // incomplete (its producer also lost partitions) cannot re-run yet:
+        // it is invalidated in the planner and requeued as UnResolved, and
+        // is re-created with fresh input locations once its producer
+        // re-finalises (see `update_stage_progress`). The rest re-run
+        // immediately: only their lost partitions are recomputed, and the
+        // planner's output accumulator is seeded with the surviving
+        // partitions' old locations (`rerun_successful_stage`).
+        let mut deferred = HashSet::new();
+        for stage_id in &resubmit_successful_stages {
+            let needs_fresh_inputs = matches!(
+                self.stages.get(stage_id),
+                Some(ExecutionStage::Successful(stage))
+                    if stage.inputs.values().any(|output| !output.complete)
             );
-            warn!("{msg}");
-            self.fail_job(msg);
-        } else {
-            for stage_id in resubmit_successful_stages.iter() {
+            if needs_fresh_inputs {
+                warn!(
+                    "Requeue successful job/stage {job_id}/{stage_id} after executor {executor_id} loss: its producer must re-run first"
+                );
+                self.planner.invalidate_stage(*stage_id)?;
+                self.requeue_successful_stage(*stage_id);
+                deferred.insert(*stage_id);
+            }
+        }
+        for stage_id in resubmit_successful_stages.iter() {
+            if !deferred.contains(stage_id) {
                 self.rerun_successful_stage(*stage_id);
             }
         }
@@ -697,6 +737,26 @@ impl AdaptiveExecutionGraph {
     /// Clear the stage failure count for this stage if the stage is finally success
     fn clear_stage_failure(&mut self, stage_id: usize) {
         self.failed_stage_attempts.remove(&stage_id);
+    }
+
+    /// Convert a successful stage back to unresolved with a bumped attempt
+    /// number (M7.4 phase 2). The stage cannot re-run in place because its
+    /// producer also lost partitions — it waits to be re-created by the
+    /// adaptive planner with fresh input locations once the producer
+    /// re-finalises.
+    fn requeue_successful_stage(&mut self, stage_id: usize) -> bool {
+        if let Some(ExecutionStage::Successful(stage)) = self.stages.remove(&stage_id) {
+            self.stages
+                .insert(stage_id, ExecutionStage::UnResolved(stage.to_unresolved()));
+            true
+        } else {
+            warn!(
+                "Fail to find a successful stage {}/{} to requeue",
+                self.job_id(),
+                stage_id
+            );
+            false
+        }
     }
 }
 
@@ -1180,8 +1240,10 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
             .values()
             .flat_map(|stage| {
                 if let ExecutionStage::Running(stage) = stage {
-                    stage.running_tasks().into_iter().map(
-                        |(task_id, stage_id, executor_id)| {
+                    stage
+                        .running_tasks()
+                        .into_iter()
+                        .map(|(task_id, stage_id, executor_id)| {
                             RunningTaskInfo::from_running(
                                 self.job_id.clone(),
                                 stage,
@@ -1189,8 +1251,7 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
                                 stage_id,
                                 executor_id,
                             )
-                        },
-                    )
+                        })
                         .collect::<Vec<RunningTaskInfo>>()
                 } else {
                     vec![]
@@ -1332,6 +1393,11 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
         failure_reasons: HashSet<String>,
     ) -> ballista_core::error::Result<Vec<RunningTaskInfo>> {
         if let Some(ExecutionStage::Running(stage)) = self.stages.remove(&stage_id) {
+            // Drop the planner's partial output for the aborted attempt:
+            // its locations mix files from executors that may no longer
+            // exist, and the re-created stage must accumulate a clean set
+            // (M7.4).
+            self.planner.invalidate_stage(stage_id)?;
             let running_tasks = stage
                 .running_tasks()
                 .into_iter()
@@ -1366,6 +1432,10 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
         stage_id: usize,
     ) -> ballista_core::error::Result<bool> {
         if let Some(ExecutionStage::Resolved(stage)) = self.stages.remove(&stage_id) {
+            // Same planner cleanup as running-stage rollback (M7.4): the
+            // resolved stage's output accumulator holds nothing yet, but the
+            // cache entry must go so re-registration is clean.
+            self.planner.invalidate_stage(stage_id)?;
             self.stages
                 .insert(stage_id, ExecutionStage::UnResolved(stage.to_unresolved()?));
             Ok(true)
@@ -1379,11 +1449,65 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
         }
     }
 
-    /// Convert successful stage to be running
+    /// Convert successful stage to be running, re-opening its finalised stage
+    /// in the adaptive planner (M7.4 phase 2).
+    ///
+    /// The planner re-open unresolves the boundary exchange and seeds the
+    /// stage's output accumulator with the surviving partitions' old
+    /// locations, so the partial re-run (only the lost partitions are
+    /// recomputed) merges with the work that was not lost. When the stage's
+    /// per-attempt state cannot be merged with a partial re-run (broadcast
+    /// boundary, window prefix-merge state, range-repartition stats) or the
+    /// re-open fails, the stage is fully re-run / the job fails with the
+    /// retryable executor-loss marker (phase-1 fallback).
     fn rerun_successful_stage(&mut self, stage_id: usize) -> bool {
         if let Some(ExecutionStage::Successful(stage)) = self.stages.remove(&stage_id) {
+            let guess_rescheduled = stage.partitions_to_reschedule();
+            let needs_full_rerun =
+                match self.planner.reopen_stage(stage_id, &guess_rescheduled) {
+                    Ok(force_full_rerun) => force_full_rerun,
+                    Err(e) => {
+                        let msg = format!(
+                            "{} (job {}, stage {stage_id}: {e})",
+                            ballista_core::AQE_EXECUTOR_LOSS_MARKER,
+                            self.job_id
+                        );
+                        warn!("{msg}");
+                        self.stages
+                            .insert(stage_id, ExecutionStage::Successful(stage));
+                        self.fail_job(msg);
+                        return false;
+                    }
+                };
+            // A partial re-run only recomputes the lost partitions. That is
+            // unsafe when the stage carries whole-attempt accumulated state:
+            // window prefix-merge state and range-repartition sketches are
+            // merged across ALL partitions of the stage, and a broadcast
+            // boundary's reader consumes every partition.
+            let needs_full_rerun = needs_full_rerun
+                || repartition_routing_expr(stage.plan.as_ref())
+                    .map(|routing| routing.is_some())
+                    .unwrap_or(false)
+                || plan_has_prefix_merge_over(&self.planner.plan, stage_id);
+            let running = if needs_full_rerun {
+                stage.to_running_rescheduling_all()
+            } else {
+                stage.to_running()
+            };
+            warn!(
+                "Re-run successful job/stage {}/{} after executor loss (attempt {}, {} of {} partitions recomputed)",
+                self.job_id,
+                stage_id,
+                running.stage_attempt_num,
+                if needs_full_rerun {
+                    stage.partitions
+                } else {
+                    guess_rescheduled.len()
+                },
+                stage.partitions
+            );
             self.stages
-                .insert(stage_id, ExecutionStage::Running(stage.to_running()));
+                .insert(stage_id, ExecutionStage::Running(running));
             true
         } else {
             warn!(
@@ -1554,6 +1678,29 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
 
         Ok(next_task)
     }
+}
+
+/// Whether a `PrefixMergeExec` consuming `producer_stage_id` exists in the
+/// plan tree. A stage whose output feeds a prefix merge carries whole-attempt
+/// window state that is merged across ALL of the stage's partitions, so a
+/// partial re-run would merge incomplete state (M7.4) — the stage must be
+/// fully re-run instead.
+fn plan_has_prefix_merge_over(
+    full_plan: &Arc<dyn ExecutionPlan>,
+    producer_stage_id: usize,
+) -> bool {
+    let mut found = false;
+    let _ = full_plan.apply(|node| {
+        if let Some(prefix_merge) = node.downcast_ref::<PrefixMergeExec>()
+            && descend_to_boundary_stage_id(prefix_merge.input())
+                == Some(producer_stage_id)
+        {
+            found = true;
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    found
 }
 
 /// Find the halos of the downstream `RangeFilterExec` planted directly on

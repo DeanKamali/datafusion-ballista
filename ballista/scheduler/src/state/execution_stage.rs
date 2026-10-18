@@ -1222,16 +1222,10 @@ impl Debug for RunningStage {
 }
 
 impl SuccessfulStage {
-    /// Change to the running state and bump the stage attempt number.
-    ///
-    /// task_infos is append-only across retries — the same partition may
-    /// appear in multiple entries (an old Failed one from a lost executor
-    /// plus a later Successful one from the retry). Walk newest-to-oldest
-    /// and, for each partition, only consider the *latest* attempt: if it's
-    /// Successful the partition is done; otherwise it goes back to pending.
-    /// Naive iteration would push the same partition multiple times.
-    pub fn to_running(&self) -> RunningStage {
-        let mut pending = PendingPartitions::empty(self.partitions);
+    /// Partitions that would go back to pending on the next attempt: the
+    /// newest task attempt for each partition is not `Successful` (M7.4 —
+    /// executor-loss recovery reschedules exactly the lost partitions).
+    pub fn partitions_to_reschedule(&self) -> Vec<usize> {
         let mut seen = vec![false; self.partitions];
         let mut to_reschedule: Vec<usize> = vec![];
         for task in self.task_infos.iter().rev() {
@@ -1247,7 +1241,36 @@ impl SuccessfulStage {
             }
         }
         to_reschedule.sort_unstable();
-        pending.reschedule(to_reschedule);
+        to_reschedule
+    }
+
+    /// Change to the running state and bump the stage attempt number,
+    /// rescheduling every partition (full re-run). Used when the stage's
+    /// accumulated per-attempt state (broadcast shape, window state, range
+    /// stats) cannot be merged with a partial re-run.
+    pub fn to_running_rescheduling_all(&self) -> RunningStage {
+        self.to_running_with_policy(true)
+    }
+
+    /// Change to the running state and bump the stage attempt number.
+    ///
+    /// task_infos is append-only across retries — the same partition may
+    /// appear in multiple entries (an old Failed one from a lost executor
+    /// plus a later Successful one from the retry). Walk newest-to-oldest
+    /// and, for each partition, only consider the *latest* attempt: if it's
+    /// Successful the partition is done; otherwise it goes back to pending.
+    /// Naive iteration would push the same partition multiple times.
+    pub fn to_running(&self) -> RunningStage {
+        self.to_running_with_policy(false)
+    }
+
+    fn to_running_with_policy(&self, reschedule_all: bool) -> RunningStage {
+        let mut pending = PendingPartitions::empty(self.partitions);
+        if reschedule_all {
+            pending.reschedule(0..self.partitions);
+        } else {
+            pending.reschedule(self.partitions_to_reschedule());
+        }
         let stage_metrics = if self.stage_metrics.is_empty() {
             None
         } else {
@@ -1304,6 +1327,23 @@ impl SuccessfulStage {
             }
         }
         reset
+    }
+
+    /// Converts this successful stage back to an unresolved stage with a
+    /// bumped attempt number (M7.4). Used when the stage must be re-created
+    /// rather than re-run in place: its producer also lost partitions, so
+    /// the stage has to wait for fresh input locations and be re-resolved
+    /// by the adaptive planner when the producer re-finalises.
+    pub fn to_unresolved(&self) -> UnresolvedStage {
+        UnresolvedStage {
+            stage_id: self.stage_id,
+            stage_attempt_num: self.stage_attempt_num + 1,
+            output_links: self.output_links.clone(),
+            inputs: self.inputs.clone(),
+            plan: self.plan.clone(),
+            last_attempt_failure_reasons: HashSet::new(),
+            session_config: self.session_config.clone(),
+        }
     }
 }
 

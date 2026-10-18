@@ -246,6 +246,18 @@ impl ExchangeExec {
         self.shuffle_partitions.lock().replace(partitions);
     }
 
+    /// Clears the resolved shuffle partitions, returning the parked locations
+    /// (indexed by output partition).
+    ///
+    /// Used when a finalised stage is re-opened after executor loss (M7.4):
+    /// the caller seeds the re-run's output accumulator with the surviving
+    /// partitions' old locations and discards the lost partitions' entries,
+    /// so the re-finalised stage's parked set is again complete and the
+    /// downstream `ShuffleReaderExec` is built over valid files only.
+    pub fn unresolve_shuffle_partitions(&self) -> Option<Vec<Vec<PartitionLocation>>> {
+        self.shuffle_partitions.lock().take()
+    }
+
     /// Checks whether the shuffle partitions have been resolved.
     ///
     /// Returns `true` if partitions have been resolved, indicating that the current stage

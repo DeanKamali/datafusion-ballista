@@ -592,6 +592,16 @@ impl SchedulerTest {
         })
     }
 
+    /// Opts submitted jobs into the adaptive (AQE) query planner, so tests
+    /// exercise `AdaptiveExecutionGraph` rather than the static planner the
+    /// harness pins by default.
+    pub fn with_adaptive_query_planner(mut self) -> Self {
+        self.session_config = self
+            .session_config
+            .with_ballista_adaptive_query_planner(true);
+        self
+    }
+
     /// Returns the number of pending jobs.
     pub fn pending_job_number(&self) -> usize {
         self.scheduler.pending_job_number()
@@ -702,6 +712,74 @@ impl SchedulerTest {
             .task_manager
             .get_job_status(job_id)
             .await
+    }
+
+    /// Returns the job's execution graph stage states as
+    /// `(stage_id, variant_name)` pairs, or `None` when the graph is not in
+    /// the active cache. Used to synchronise tests on stage-level progress
+    /// (e.g. "a stage finalised while another is running").
+    pub async fn job_stages(
+        &self,
+        job_id: &JobId,
+    ) -> Result<Option<Vec<(usize, &'static str)>>> {
+        let Some(graph_arc) = self
+            .scheduler
+            .state
+            .task_manager
+            .get_active_execution_graph(job_id)
+        else {
+            return Ok(None);
+        };
+        let graph = graph_arc.read().await;
+        let stages = graph
+            .stages()
+            .iter()
+            .map(|(id, stage)| {
+                let variant = match stage {
+                    ExecutionStage::UnResolved(_) => "UnResolved",
+                    ExecutionStage::Resolved(_) => "Resolved",
+                    ExecutionStage::Running(_) => "Running",
+                    ExecutionStage::Successful(_) => "Successful",
+                    ExecutionStage::Failed(_) => "Failed",
+                };
+                (*id, variant)
+            })
+            .collect();
+        Ok(Some(stages))
+    }
+
+    /// Executor ids that produced successful tasks in finalised stages of
+    /// the job's graph. Used by tests that need to lose the executor
+    /// actually holding a stage's shuffle output.
+    pub async fn successful_stage_executors(
+        &self,
+        job_id: &JobId,
+    ) -> Result<Vec<String>> {
+        let Some(graph_arc) = self
+            .scheduler
+            .state
+            .task_manager
+            .get_active_execution_graph(job_id)
+        else {
+            return Ok(vec![]);
+        };
+        let graph = graph_arc.read().await;
+        let mut executors: Vec<String> = vec![];
+        for stage in graph.stages().values() {
+            if let ExecutionStage::Successful(stage) = stage {
+                for info in &stage.task_infos {
+                    if let task_status::Status::Successful(SuccessfulTask {
+                        executor_id,
+                        ..
+                    }) = &info.task_status
+                        && !executors.contains(executor_id)
+                    {
+                        executors.push(executor_id.clone());
+                    }
+                }
+            }
+        }
+        Ok(executors)
     }
 
     /// Returns job status and job_id

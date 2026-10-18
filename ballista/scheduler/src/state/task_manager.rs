@@ -773,7 +773,9 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                     running_tasks_to_cancel.extend(reset.1);
                 }
                 if let Some(job_status::Status::Failed(failed)) = &graph.status().status
-                    && failed.error.contains(ballista_core::AQE_EXECUTOR_LOSS_MARKER)
+                    && failed
+                        .error
+                        .contains(ballista_core::AQE_EXECUTOR_LOSS_MARKER)
                 {
                     failed_jobs.push((
                         job_id.clone(),

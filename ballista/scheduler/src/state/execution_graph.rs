@@ -1267,8 +1267,10 @@ impl ExecutionGraph for StaticExecutionGraph {
             .values()
             .flat_map(|stage| {
                 if let ExecutionStage::Running(stage) = stage {
-                    stage.running_tasks().into_iter().map(
-                        |(task_id, stage_id, executor_id)| {
+                    stage
+                        .running_tasks()
+                        .into_iter()
+                        .map(|(task_id, stage_id, executor_id)| {
                             RunningTaskInfo::from_running(
                                 self.job_id.clone(),
                                 stage,
@@ -1276,8 +1278,7 @@ impl ExecutionGraph for StaticExecutionGraph {
                                 stage_id,
                                 executor_id,
                             )
-                        },
-                    )
+                        })
                         .collect::<Vec<RunningTaskInfo>>()
                 } else {
                     vec![]

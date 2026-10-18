@@ -682,7 +682,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                 if self.state.config.is_push_staged_scheduling() {
                     let slots = refund_slots(&tasks, None);
                     if !slots.is_empty()
-                        && let Err(e) = self.state.executor_manager.unbind_tasks(slots).await
+                        && let Err(e) =
+                            self.state.executor_manager.unbind_tasks(slots).await
                     {
                         warn!("Fail to refund vcores for cancelled tasks: {e:?}");
                     }
@@ -730,7 +731,7 @@ mod tests {
     };
     use ballista_core::BALLISTA_PROTOCOL_VERSION;
     use ballista_core::config::TaskSchedulingPolicy;
-    use ballista_core::error::Result;
+    use ballista_core::error::{BallistaError, Result};
     use ballista_core::extension::SessionConfigExt;
     use ballista_core::serde::BallistaCodec;
     use ballista_core::serde::protobuf::job_status;
@@ -1136,6 +1137,176 @@ mod tests {
                 Some(job_status::Status::Failed(_))
             ),
             "job must not be failed while an executor remains, but status was {status:?}"
+        );
+
+        Ok(())
+    }
+
+    /// Builds a two-stage aggregate plan over a real in-memory table for
+    /// the adaptive planner. An aggregate over an *empty* scan is optimised
+    /// away (no exchange, single stage), which defeats the stage re-run
+    /// scenario, so this plan must carry actual rows.
+    async fn aqe_test_plan(
+        ctx: &datafusion::prelude::SessionContext,
+    ) -> Result<LogicalPlan> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("gmv", DataType::UInt64, false),
+        ]));
+        let batch = datafusion::arrow::array::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(datafusion::arrow::array::StringArray::from(vec![
+                    "a", "b", "c",
+                ])),
+                Arc::new(datafusion::arrow::array::UInt64Array::from(vec![1, 2, 3])),
+            ],
+        )
+        .map_err(|e| BallistaError::General(e.to_string()))?;
+        let table = datafusion::datasource::MemTable::try_new(
+            schema,
+            vec![vec![batch.clone()], vec![batch]],
+        )
+        .map_err(|e| BallistaError::General(e.to_string()))?;
+        ctx.register_table("t", Arc::new(table))
+            .map_err(|e| BallistaError::General(e.to_string()))?;
+        let df = ctx
+            .sql("select id, sum(gmv) from t group by id")
+            .await
+            .map_err(|e| BallistaError::General(e.to_string()))?;
+        let plan = df.logical_plan().clone();
+        Ok(plan)
+    }
+
+    /// M7.4 phase 2: an executor lost AFTER a stage finalised must not hang
+    /// the job. The AQE planner re-opens the finalised producer, re-runs only
+    /// its lost partitions, and re-creates the rolled-back consumer — the
+    /// job completes instead of stalling until the statement timeout.
+    #[tokio::test]
+    async fn test_executor_loss_after_stage_finalise_completes_via_stage_rerun()
+    -> Result<()> {
+        let metrics_collector = Arc::new(TestMetricsCollector::default());
+
+        let mut test = SchedulerTest::new(
+            SchedulerConfig::default()
+                .with_scheduler_policy(TaskSchedulingPolicy::PushStaged)
+                .with_no_executors_grace_period_seconds(0),
+            metrics_collector.clone(),
+            2,
+            1,
+            None,
+        )
+        .await?
+        .with_adaptive_query_planner();
+
+        let ctx = test.ctx().await?;
+        let plan = aqe_test_plan(&ctx).await?;
+
+        let job_id = test.submit("", &plan).await?;
+
+        // Drive task-status updates until a stage has finalised while
+        // another stage is running — the deterministic kill point.
+        let mut staged = false;
+        for _ in 0..2000 {
+            let _ = tokio::time::timeout(Duration::from_millis(10), test.tick()).await;
+            if let Some(stages) = test.job_stages(&job_id).await?
+                && stages.iter().any(|(_id, state)| *state == "Successful")
+                && stages.iter().any(|(_id, state)| *state == "Running")
+            {
+                staged = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            staged,
+            "a stage should finalise while another runs; stages: {:?}, status: {:?}",
+            test.job_stages(&job_id).await?,
+            test.job_status(&job_id).await?
+        );
+
+        // Kill the executor that actually produced the finalised stage's
+        // shuffle output — its unprocessed stage-2 status batches are still
+        // queued in the harness channel, so the scheduler is frozen exactly
+        // at "producer finalised, consumer mid-flight" — the state the AQE
+        // planner could not recover from before M7.4 phase 2. (The producer
+        // can land on either virtual executor, so the victim must be
+        // derived from the graph rather than hardcoded.)
+        let victim = test
+            .successful_stage_executors(&job_id)
+            .await?
+            .into_iter()
+            .next()
+            .expect("a successful stage should have a producing executor");
+        test.lose_executor(&victim).await?;
+
+        // Let the event loop process the loss BEFORE delivering any queued
+        // task status: the reset must see the frozen state. The reset is
+        // visible as either a job failure (phase-1 fallback: adaptive
+        // planning could not re-open the finalised stage) or a rolled-back
+        // consumer stage (phase 2: re-run path).
+        let reset_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut reset_applied = false;
+        while tokio::time::Instant::now() < reset_deadline {
+            if matches!(
+                test.job_status(&job_id).await?.and_then(|s| s.status),
+                Some(job_status::Status::Failed(_))
+            ) {
+                reset_applied = true;
+                break;
+            }
+            if let Some(stages) = test.job_stages(&job_id).await?
+                && stages.iter().any(|(_id, state)| *state == "UnResolved")
+            {
+                reset_applied = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            reset_applied,
+            "executor loss should reset the job; stages: {:?}",
+            test.job_stages(&job_id).await?
+        );
+
+        // The job must reach Successful through the stage re-run path —
+        // deliver the queued statuses now (tolerating quiet periods while
+        // the recovery rebinding happens) and poll the job status, bounded
+        // by a wall-clock deadline so a regression that hangs the job fails
+        // the test quickly instead of stalling for minutes.
+        let success_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let mut success = false;
+        while tokio::time::Instant::now() < success_deadline {
+            let _ = tokio::time::timeout(Duration::from_secs(1), test.tick()).await;
+            if matches!(
+                test.job_status(&job_id).await?.and_then(|s| s.status),
+                Some(job_status::Status::Successful(_))
+            ) {
+                success = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            success,
+            "job should complete via stage re-run after executor loss; status: {:?}, stages: {:?}",
+            test.job_status(&job_id).await?,
+            test.job_stages(&job_id).await?
+        );
+
+        // The recovered cluster must not leak the cancelled tasks' vcores:
+        // a follow-up job has to complete on the surviving executor.
+        let (status, _) = tokio::time::timeout(
+            Duration::from_secs(60),
+            test.run("", &plan),
+        )
+        .await
+        .expect(
+            "follow-up job should complete within 60s (vcores were leaked if it stalls)",
+        )?;
+        assert!(
+            matches!(status.status, Some(job_status::Status::Successful(_))),
+            "follow-up job should complete (vcores were leaked if it stalls)"
         );
 
         Ok(())

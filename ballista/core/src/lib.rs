@@ -29,11 +29,11 @@ pub use crate::ids::JobId;
 /// The current version of Ballista, derived from the Cargo package version.
 pub const BALLISTA_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Marker embedded in the job-failure message when adaptive planning cannot
-/// re-run a stage that an executor loss finalised (M7.4). Clients match this
-/// substring to retry the whole query once. Stage-level re-open under AQE is
-/// a separate upstream change; until then failing fast beats hanging until
-/// the statement timeout.
+/// Marker embedded in the job-failure message when adaptive stage re-open
+/// fails after an executor loss (M7.4). Clients match this substring to
+/// retry the whole query once. Since the phase-2 AQE re-open, in-place
+/// stage re-runs are the primary recovery path; this marker only fires if
+/// the planner cannot re-open the finalised stage (structural surprise).
 pub const AQE_EXECUTOR_LOSS_MARKER: &str =
     "ExecutorLost: stage finalised; rerun unsupported under adaptive planning";
 

@@ -207,6 +207,92 @@ impl AdaptivePlanner {
         self.runnable_stage_cache.contains_key(&stage_id)
     }
 
+    /// Finds the boundary `ExchangeExec` for `stage_id` in the current plan
+    /// tree by its stage id. Stage ids are stamped on the exchange's atomic,
+    /// so the instance survives replans.
+    fn find_exchange_by_stage_id(
+        node: &Arc<dyn ExecutionPlan>,
+        stage_id: usize,
+    ) -> Option<Arc<dyn ExecutionPlan>> {
+        if let Some(exchange) = node.downcast_ref::<ExchangeExec>()
+            && exchange.stage_id() == Some(stage_id)
+        {
+            return Some(node.clone());
+        }
+        node.children()
+            .into_iter()
+            .find_map(|child| Self::find_exchange_by_stage_id(child, stage_id))
+    }
+
+    /// Re-opens a previously finalised stage so it can re-run in place after
+    /// executor loss (M7.4 phase 2).
+    ///
+    /// Takes the parked shuffle partitions off the boundary `ExchangeExec`,
+    /// unresolves it (so `find_runnable_exchanges` discovers it again), and
+    /// re-registers the stage in the runnable cache with a fresh output
+    /// accumulator seeded with the surviving partitions' old locations.
+    /// Partitions in `exclude_partitions` (the ones being re-run) are not
+    /// seeded — their new locations arrive from the re-run's task
+    /// completions, so the re-finalised stage's parked set is complete and
+    /// downstream readers only ever see valid files.
+    ///
+    /// Returns `true` when the stage must be fully re-run (broadcast
+    /// boundary — the parked set's shape is not indexed by output
+    /// partition, so it cannot be partially seeded).
+    pub(super) fn reopen_stage(
+        &mut self,
+        stage_id: usize,
+        exclude_partitions: &[usize],
+    ) -> common::Result<bool> {
+        let exec =
+            Self::find_exchange_by_stage_id(&self.plan, stage_id).ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "reopen_stage: stage {stage_id} boundary exchange not found in plan"
+                ))
+            })?;
+        let exchange = exec.downcast_ref::<ExchangeExec>().ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "reopen_stage: stage {stage_id} root is {}, not ExchangeExec",
+                exec.name()
+            ))
+        })?;
+        let force_full_rerun = exchange.broadcast;
+        let old = exchange.unresolve_shuffle_partitions();
+        let mut output = StageOutput::new();
+        if let Some(old) = old
+            && !force_full_rerun
+        {
+            for (idx, locs) in old.into_iter().enumerate() {
+                if exclude_partitions.contains(&idx) {
+                    continue;
+                }
+                for loc in locs {
+                    output.add_partition(loc);
+                }
+            }
+        }
+        self.runnable_stage_cache.insert(stage_id, exec);
+        self.runnable_stage_output.insert(stage_id, output);
+        Ok(force_full_rerun)
+    }
+
+    /// Drops the planner state (cache entry + output accumulator) for a
+    /// stage that is being rolled back or requeued, and unresolves its
+    /// boundary exchange. The stage is re-registered with a fresh output
+    /// accumulator when the adaptive planner re-emits it, so stale partial
+    /// locations from the aborted attempt never leak into the re-created
+    /// stage's reader.
+    pub(super) fn invalidate_stage(&mut self, stage_id: usize) -> common::Result<()> {
+        if let Some(exec) = Self::find_exchange_by_stage_id(&self.plan, stage_id) {
+            if let Some(exchange) = exec.downcast_ref::<ExchangeExec>() {
+                let _ = exchange.unresolve_shuffle_partitions();
+            }
+            self.runnable_stage_cache.remove(&stage_id);
+            self.runnable_stage_output.remove(&stage_id);
+        }
+        Ok(())
+    }
+
     /// Attaches range-repartition-recovered range boundaries to the
     /// boundary `ExchangeExec` for `stage_id`. Called right after the
     /// completed range-repartition stage's partition mapping is resolved;
@@ -466,7 +552,20 @@ impl AdaptivePlanner {
                         self.stage_id_generator += 1;
                         runnable.push(exec);
                     }
-                    Some(_) => {
+                    Some(exchange) => {
+                        // The stage was already registered once. Re-register
+                        // its cache and output slots if they were cleared by
+                        // a rollback / requeue (M7.4 executor-loss recovery)
+                        // — `or_insert`/`or_default` keep the live state of
+                        // stages that are running normally.
+                        if let Some(stage_id) = exchange.stage_id() {
+                            self.runnable_stage_cache
+                                .entry(stage_id)
+                                .or_insert(exec.clone());
+                            self.runnable_stage_output
+                                .entry(stage_id)
+                                .or_insert_with(StageOutput::new);
+                        }
                         runnable.push(exec);
                     }
                     None => exec_err!("It is not a exchange")?,
