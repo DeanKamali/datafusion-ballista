@@ -160,6 +160,22 @@ pub type BoundTask = (String, TaskDescription);
 /// Tuple of (executor_id, slot_count).
 pub type ExecutorSlot = (String, u32);
 
+/// A durable record that executor `executor_id` was lost.
+///
+/// Written when a scheduler removes an executor from the shared cluster
+/// state so that every replica sharing that state — not only the replica
+/// whose removal path detected the loss — can post `ExecutorLost` on its
+/// own event loop and recover the jobs it owns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutorLoss {
+    /// Backend-assigned loss id, strictly increasing (consumption watermark).
+    pub id: i64,
+    /// The lost executor.
+    pub executor_id: String,
+    /// Removal reason, if any.
+    pub reason: Option<String>,
+}
+
 /// Trait for maintaining a globally consistent view of cluster resources.
 ///
 /// Implementations track executor registration, heartbeats, and free vcores.
@@ -210,6 +226,33 @@ pub trait ClusterState: Send + Sync + 'static {
 
     /// Removes an executor from the cluster.
     async fn remove_executor(&self, executor_id: &str) -> Result<()>;
+
+    /// Records a durable executor-loss event.
+    ///
+    /// Called after an executor is removed so peer schedulers sharing this
+    /// state can learn of the loss. At most one loss is recorded per
+    /// executor. The default implementation is a no-op for backends without
+    /// cross-replica loss propagation.
+    async fn record_executor_loss(
+        &self,
+        _executor_id: &str,
+        _reason: Option<&str>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Returns durable executor-loss events with id greater than
+    /// `since_loss_id`, ordered by id.
+    ///
+    /// Replicas sharing the cluster state consume these to post
+    /// `ExecutorLost` on their own event loops (M7.4 phase 2: cross-replica
+    /// loss propagation). The default implementation returns an empty list.
+    async fn pending_executor_losses(
+        &self,
+        _since_loss_id: i64,
+    ) -> Result<Vec<ExecutorLoss>> {
+        Ok(vec![])
+    }
 
     /// Returns the last seen heartbeat for all active executors.
     fn executor_heartbeats(&self) -> HashMap<String, ExecutorHeartbeat>;

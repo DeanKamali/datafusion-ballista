@@ -254,6 +254,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
         self.state.init().await?;
         self.query_stage_event_loop.start()?;
         self.expire_dead_executors()?;
+        self.consume_executor_losses()?;
 
         Ok(())
     }
@@ -469,6 +470,39 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerServer<T
                     state.config.expire_dead_executor_interval_seconds,
                 ))
                 .await;
+            }
+        });
+        Ok(())
+    }
+
+    /// Spawn an async task which periodically consumes durable executor-loss
+    /// events recorded in the shared cluster state and posts `ExecutorLost`
+    /// on this replica's event loop — including losses detected by peer
+    /// schedulers sharing the same state backend (M7.4 phase 2). Without
+    /// this, the replica that owns a job may never learn that an executor
+    /// executing its tasks died: only the replica whose reaper fired posts
+    /// the event locally.
+    fn consume_executor_losses(&self) -> Result<()> {
+        let state = self.state.clone();
+        let event_sender = self.query_stage_event_loop.get_sender()?;
+        tokio::task::spawn(async move {
+            // Start from the latest durable loss: rows older than this
+            // scheduler's start are stale by definition (an executor never
+            // comes back under the same id).
+            let mut watermark: i64 = state
+                .cluster
+                .pending_executor_losses(0)
+                .await
+                .map(|losses| losses.iter().map(|l| l.id).max().unwrap_or(0))
+                .unwrap_or(0);
+            if watermark > 0 {
+                info!("executor-loss consumer starting at watermark {watermark}");
+            }
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                state
+                    .process_executor_losses(&event_sender, &mut watermark)
+                    .await;
             }
         });
         Ok(())

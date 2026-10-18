@@ -28,6 +28,7 @@ use ballista_core::event_loop::EventSender;
 use ballista_core::serde::BallistaCodec;
 use ballista_core::serde::protobuf::TaskStatus;
 use ballista_core::{JobId, JobStatusSubscriber};
+use dashmap::DashSet;
 use datafusion::execution::context::SessionContext;
 use datafusion_proto::logical_plan::AsLogicalPlan;
 use datafusion_proto::physical_plan::AsExecutionPlan;
@@ -37,6 +38,8 @@ use std::any::type_name;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
+
+use crate::cluster::ClusterState;
 
 mod aqe;
 mod distributed_explain;
@@ -107,6 +110,12 @@ pub struct SchedulerState<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPl
     pub codec: BallistaCodec<T, U>,
     /// Scheduler configuration.
     pub config: Arc<SchedulerConfig>,
+    /// The shared cluster state, for durable executor-loss propagation.
+    pub(crate) cluster: Arc<dyn ClusterState>,
+    /// Executor ids this replica already posted `ExecutorLost` for on its
+    /// own removal path. The durable-loss consumer skips these so a loss is
+    /// processed exactly once per replica.
+    pub(crate) direct_posted_losses: Arc<DashSet<String>>,
 }
 
 impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T, U> {
@@ -131,6 +140,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
                 config.clone(),
             ),
             session_manager: SessionManager::new(cluster.job_state()),
+            cluster: cluster.cluster_state(),
+            direct_posted_losses: Arc::new(DashSet::new()),
             codec,
             config,
         }
@@ -173,6 +184,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
                 config.clone(),
             ),
             session_manager: SessionManager::new(cluster.job_state()),
+            cluster: cluster.cluster_state(),
+            direct_posted_losses: Arc::new(DashSet::new()),
             codec,
             config,
         }
@@ -269,15 +282,81 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerState<T,
             warn!("Fail to remove executor {executor_id}: {e}");
         }
 
+        // Mark the direct post BEFORE recording the durable loss, so the
+        // loss consumer (which may observe the record immediately) does not
+        // post a duplicate `ExecutorLost` on this replica (M7.4 phase 2).
+        self.direct_posted_losses.insert(executor_id.to_owned());
+
         if let Err(e) = sender
             .post_event(QueryStageSchedulerEvent::ExecutorLost(
                 executor_id.to_owned(),
-                reason,
+                reason.clone(),
             ))
             .await
         {
             error!("Fail to post ExecutorLost for executor {executor_id}: {e:?}");
         }
+
+        // Record the loss durably so peer schedulers sharing this cluster
+        // state also post `ExecutorLost` and recover the jobs they own.
+        if let Err(e) = self
+            .cluster
+            .record_executor_loss(executor_id, reason.as_deref())
+            .await
+        {
+            warn!("Fail to record executor loss {executor_id}: {e}");
+        }
+    }
+
+    /// Core of the durable-loss consumer: fetch losses past `watermark` from
+    /// the shared cluster state, post `ExecutorLost` for each loss this
+    /// replica did not post itself, and advance `watermark`. Returns the
+    /// executor ids posted.
+    ///
+    /// This is how the replica that owns a job learns that an executor
+    /// executing its tasks died when the loss was detected by a peer
+    /// scheduler sharing the same state backend (M7.4 phase 2).
+    pub(crate) async fn process_executor_losses(
+        &self,
+        sender: &EventSender<QueryStageSchedulerEvent>,
+        watermark: &mut i64,
+    ) -> Vec<String> {
+        let mut posted = Vec::new();
+        let Ok(losses) = self.cluster.pending_executor_losses(*watermark).await else {
+            return posted;
+        };
+        for loss in losses {
+            if loss.id > *watermark {
+                *watermark = loss.id;
+            }
+            if self
+                .direct_posted_losses
+                .remove(&loss.executor_id)
+                .is_some()
+            {
+                // Already posted locally by this replica's removal path.
+                continue;
+            }
+            info!(
+                "posting ExecutorLost from shared loss event: executor {}",
+                loss.executor_id
+            );
+            if let Err(e) = sender
+                .post_event(QueryStageSchedulerEvent::ExecutorLost(
+                    loss.executor_id.clone(),
+                    loss.reason.clone(),
+                ))
+                .await
+            {
+                error!(
+                    "Fail to post ExecutorLost from shared loss event for executor {}: {e:?}",
+                    loss.executor_id
+                );
+            } else {
+                posted.push(loss.executor_id);
+            }
+        }
+        posted
     }
 
     /// Given a vector of bound tasks,
@@ -469,6 +548,7 @@ mod tests {
     use crate::state::executor_manager::ExecutorManager;
     use crate::state::task_manager::TaskLauncher;
     use crate::test_utils::test_cluster_context;
+    use ballista_core::event_loop::EventSender;
     use ballista_core::extension::SessionConfigExt;
     use ballista_core::serde::BallistaCodec;
     use ballista_core::serde::protobuf::MultiTaskDefinition;
@@ -697,6 +777,58 @@ mod tests {
         let freed: u32 = unassigned_slots.iter().map(|(_, n)| *n).sum();
         assert_eq!(freed as usize, orphaned);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executor_loss_is_propagated_via_durable_record() -> Result<()> {
+        let state: SchedulerState<LogicalPlanNode, PhysicalPlanNode> =
+            SchedulerState::new_with_default_scheduler_endpoint(
+                test_cluster_context(),
+                BallistaCodec::default(),
+            );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let sender = EventSender::new(tx);
+
+        // Local removal: posts `ExecutorLost` directly AND records durably.
+        state
+            .remove_executor("executor-1", Some("test loss".to_string()), &sender)
+            .await;
+        let losses = state.cluster.pending_executor_losses(0).await?;
+        assert_eq!(losses.len(), 1, "one durable loss row");
+        assert_eq!(losses[0].executor_id, "executor-1");
+        assert_eq!(losses[0].reason.as_deref(), Some("test loss"));
+
+        // The consumer skips losses this replica posted directly: no
+        // duplicate event, watermark still advances.
+        let mut watermark = 0;
+        let posted = state.process_executor_losses(&sender, &mut watermark).await;
+        assert!(posted.is_empty(), "direct post must not be duplicated");
+        assert_eq!(watermark, losses[0].id);
+
+        // A loss recorded by a PEER is posted locally...
+        state
+            .cluster
+            .record_executor_loss("executor-2", Some("peer reaper"))
+            .await?;
+        let posted = state.process_executor_losses(&sender, &mut watermark).await;
+        assert_eq!(posted, vec!["executor-2".to_string()]);
+        // ...and both events arrive on the event loop: the direct one first,
+        // then the peer-loss one.
+        match rx.recv().await.unwrap() {
+            QueryStageSchedulerEvent::ExecutorLost(id, reason) => {
+                assert_eq!(id, "executor-1");
+                assert_eq!(reason.as_deref(), Some("test loss"));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        match rx.recv().await.unwrap() {
+            QueryStageSchedulerEvent::ExecutorLost(id, reason) => {
+                assert_eq!(id, "executor-2");
+                assert_eq!(reason.as_deref(), Some("peer reaper"));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
         Ok(())
     }
 }

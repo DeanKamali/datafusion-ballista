@@ -16,8 +16,9 @@
 // under the License.
 
 use crate::cluster::{
-    BoundTask, ClusterState, ExecutorSlot, JobState, JobStateEvent, JobStateEventStream,
-    JobStatus, TaskDistributionPolicy, bind_task_bias, bind_task_round_robin,
+    BoundTask, ClusterState, ExecutorLoss, ExecutorSlot, JobState, JobStateEvent,
+    JobStateEventStream, JobStatus, TaskDistributionPolicy, bind_task_bias,
+    bind_task_round_robin,
 };
 use crate::state::execution_graph::ExecutionGraphBox;
 use ballista_core::error::{BallistaError, Result};
@@ -60,6 +61,10 @@ pub struct InMemoryClusterState {
     heartbeats: DashMap<String, ExecutorHeartbeat>,
     /// Broadcast sender for cluster state change events.
     cluster_event_sender: ClusterEventSender<ClusterStateEvent>,
+    /// Durable executor-loss records (cross-replica loss propagation).
+    /// An in-memory backend is per-process, but the same record/consume API
+    /// is exercised so scheduler-level behaviour is identical either way.
+    executor_losses: Arc<std::sync::Mutex<Vec<ExecutorLoss>>>,
 }
 
 #[async_trait::async_trait]
@@ -274,6 +279,43 @@ impl ClusterState for InMemoryClusterState {
 
     async fn cluster_state_events(&self) -> Result<ClusterStateEventStream> {
         Ok(Box::pin(self.cluster_event_sender.subscribe()))
+    }
+
+    async fn record_executor_loss(
+        &self,
+        executor_id: &str,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        let mut losses = self
+            .executor_losses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // At most one loss per executor.
+        if losses.iter().any(|l| l.executor_id == executor_id) {
+            return Ok(());
+        }
+        let id = losses.iter().map(|l| l.id).max().unwrap_or(0) + 1;
+        losses.push(ExecutorLoss {
+            id,
+            executor_id: executor_id.to_string(),
+            reason: reason.map(str::to_string),
+        });
+        Ok(())
+    }
+
+    async fn pending_executor_losses(
+        &self,
+        since_loss_id: i64,
+    ) -> Result<Vec<ExecutorLoss>> {
+        let losses = self
+            .executor_losses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        Ok(losses
+            .iter()
+            .filter(|l| l.id > since_loss_id)
+            .cloned()
+            .collect())
     }
 }
 
@@ -969,6 +1011,30 @@ mod test {
             assert_eq!(rows, ctx.table("t").await?.count().await?);
         }
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn executor_losses_recorded_once_per_executor() -> Result<()> {
+        let state = InMemoryClusterState::default();
+        state.record_executor_loss("e1", Some("reason")).await?;
+        // Duplicate record for the same executor is ignored.
+        state.record_executor_loss("e1", None).await?;
+        state.record_executor_loss("e2", None).await?;
+
+        let losses = state.pending_executor_losses(0).await?;
+        assert_eq!(losses.len(), 2);
+        assert_eq!(losses[0].executor_id, "e1");
+        assert_eq!(losses[0].reason.as_deref(), Some("reason"));
+        assert_eq!(losses[0].id, 1);
+        assert_eq!(losses[1].executor_id, "e2");
+        assert_eq!(losses[1].id, 2);
+
+        // Watermark filtering.
+        let later = state.pending_executor_losses(1).await?;
+        assert_eq!(later.len(), 1);
+        assert_eq!(later[0].executor_id, "e2");
+        assert!(state.pending_executor_losses(2).await?.is_empty());
         Ok(())
     }
 }
