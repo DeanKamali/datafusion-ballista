@@ -663,8 +663,27 @@ impl AdaptiveExecutionGraph {
             all_running_tasks.extend(tasks);
         }
 
-        for stage_id in resubmit_successful_stages.iter() {
-            self.rerun_successful_stage(*stage_id);
+        // Adaptive planning finalises a stage on first completion and cannot
+        // re-open it (M7.4). Rolling a downstream stage back, or re-running a
+        // successful producer, leaves the job unable to make progress — fail
+        // it with a distinguishable message so the client can resubmit once,
+        // instead of hanging until the statement timeout. In-flight-only loss
+        // (tasks reset inside a still-running stage, no rollback) still
+        // recovers here.
+        let needs_finalised_rerun = !resubmit_successful_stages.is_empty()
+            || !rollback_running_stages.is_empty()
+            || !rollback_resolved_stages.is_empty();
+        if needs_finalised_rerun {
+            let msg = format!(
+                "{} (job {job_id}, executor {executor_id})",
+                ballista_core::AQE_EXECUTOR_LOSS_MARKER
+            );
+            warn!("{msg}");
+            self.fail_job(msg);
+        } else {
+            for stage_id in resubmit_successful_stages.iter() {
+                self.rerun_successful_stage(*stage_id);
+            }
         }
 
         let mut reset_stage = HashSet::new();
@@ -1161,15 +1180,17 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
             .values()
             .flat_map(|stage| {
                 if let ExecutionStage::Running(stage) = stage {
-                    stage
-                        .running_tasks()
-                        .into_iter()
-                        .map(|(task_id, stage_id, executor_id)| RunningTaskInfo {
-                            task_id,
-                            job_id: self.job_id.clone(),
-                            stage_id,
-                            executor_id,
-                        })
+                    stage.running_tasks().into_iter().map(
+                        |(task_id, stage_id, executor_id)| {
+                            RunningTaskInfo::from_running(
+                                self.job_id.clone(),
+                                stage,
+                                task_id,
+                                stage_id,
+                                executor_id,
+                            )
+                        },
+                    )
                         .collect::<Vec<RunningTaskInfo>>()
                 } else {
                     vec![]
@@ -1314,11 +1335,14 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
             let running_tasks = stage
                 .running_tasks()
                 .into_iter()
-                .map(|(task_id, stage_id, executor_id)| RunningTaskInfo {
-                    task_id,
-                    job_id: self.job_id.clone(),
-                    stage_id,
-                    executor_id,
+                .map(|(task_id, stage_id, executor_id)| {
+                    RunningTaskInfo::from_running(
+                        self.job_id.clone(),
+                        &stage,
+                        task_id,
+                        stage_id,
+                        executor_id,
+                    )
                 })
                 .collect();
             self.stages.insert(

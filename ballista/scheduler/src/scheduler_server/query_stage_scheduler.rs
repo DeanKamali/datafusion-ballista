@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -40,6 +41,20 @@ use crate::scheduler_server::event::QueryStageSchedulerEvent;
 use crate::scheduler_server::event_log;
 
 use crate::state::SchedulerState;
+use crate::state::execution_graph::RunningTaskInfo;
+
+/// Vcores to return to executors whose tasks were cancelled by a rollback.
+/// `exclude` is the lost executor (its slot row is already gone).
+fn refund_slots(tasks: &[RunningTaskInfo], exclude: Option<&str>) -> Vec<(String, u32)> {
+    let mut freed: HashMap<String, u32> = HashMap::new();
+    for task in tasks {
+        if exclude.is_some_and(|id| id == task.executor_id) || task.vcores_consumed == 0 {
+            continue;
+        }
+        *freed.entry(task.executor_id.clone()).or_default() += task.vcores_consumed;
+    }
+    freed.into_iter().collect()
+}
 
 pub(crate) struct QueryStageScheduler<
     T: 'static + AsLogicalPlan,
@@ -524,7 +539,23 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
             }
             QueryStageSchedulerEvent::ExecutorLost(executor_id, _) => {
                 match self.state.task_manager.executor_lost(&executor_id).await {
-                    Ok(tasks) => {
+                    Ok(outcome) => {
+                        let tasks = outcome.tasks_to_cancel;
+                        // Refund survivor vcores now. The rolled-back stage's
+                        // `task_infos` is already gone, so the late TaskKilled
+                        // status cannot refund them (M7.4). The lost executor's
+                        // row was removed with it.
+                        if self.state.config.is_push_staged_scheduling() {
+                            let slots = refund_slots(&tasks, Some(&executor_id));
+                            if !slots.is_empty()
+                                && let Err(e) =
+                                    self.state.executor_manager.unbind_tasks(slots).await
+                            {
+                                warn!(
+                                    "Fail to refund vcores after executor {executor_id} loss: {e:?}"
+                                );
+                            }
+                        }
                         if !tasks.is_empty()
                             && let Err(e) = self
                                 .state
@@ -533,6 +564,21 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                                 .await
                         {
                             warn!("Fail to cancel running tasks due to {e:?}");
+                        }
+                        for (job_id, queued_at, fail_message) in outcome.failed_jobs {
+                            if let Err(e) = event_sender
+                                .post_event(QueryStageSchedulerEvent::JobRunningFailed {
+                                    job_id: job_id.clone(),
+                                    fail_message,
+                                    queued_at,
+                                    failed_at: timestamp_millis(),
+                                })
+                                .await
+                            {
+                                error!(
+                                    "Fail to post JobRunningFailed for job {job_id}: {e:?}"
+                                );
+                            }
                         }
                         if self.state.config.is_push_staged_scheduling() {
                             event_sender
@@ -631,6 +677,16 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
                 }
             }
             QueryStageSchedulerEvent::CancelTasks(tasks) => {
+                // Same refund-at-rollback as ExecutorLost: these tasks' stage
+                // is already UnResolved, so their later TaskKilled refunds 0.
+                if self.state.config.is_push_staged_scheduling() {
+                    let slots = refund_slots(&tasks, None);
+                    if !slots.is_empty()
+                        && let Err(e) = self.state.executor_manager.unbind_tasks(slots).await
+                    {
+                        warn!("Fail to refund vcores for cancelled tasks: {e:?}");
+                    }
+                }
                 if let Err(e) = self
                     .state
                     .executor_manager

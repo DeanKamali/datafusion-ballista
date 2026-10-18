@@ -181,6 +181,16 @@ pub struct UpdatedStages {
     pub resubmit_successful_stages: HashSet<usize>,
 }
 
+/// Outcome of [`TaskManager::executor_lost`].
+pub struct ExecutorLostOutcome {
+    /// In-flight tasks on stages that were rolled back. Their
+    /// `vcores_consumed` was captured before `task_infos` was dropped.
+    pub tasks_to_cancel: Vec<RunningTaskInfo>,
+    /// Jobs failed because adaptive planning cannot re-run a finalised
+    /// stage: `(job_id, queued_at, message)`.
+    pub failed_jobs: Vec<(JobId, u64, String)>,
+}
+
 impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U> {
     /// Creates a new `TaskManager` with the default task launcher.
     pub fn new(
@@ -532,9 +542,14 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             };
             let graph = graph_arc.read().await;
             for status in job_statuses {
-                if let Some(vcores) =
-                    graph.task_vcores(status.stage_id as usize, status.task_id as usize)
-                {
+                // Attempt-aware: a TaskKilled from a rolled-back attempt must
+                // not refund vcores the scheduler already returned at rollback
+                // time, nor vcores a newer attempt of the same task slot holds.
+                if let Some(vcores) = graph.task_vcores_for_attempt(
+                    status.stage_id as usize,
+                    status.stage_attempt_num as usize,
+                    status.task_id as usize,
+                ) {
                     total_vcores += vcores;
                 }
             }
@@ -742,23 +757,37 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
 
     /// Handles executor loss by resetting affected tasks and stages.
     ///
-    /// Returns a list of running tasks that need to be cancelled.
-    pub async fn executor_lost(&self, executor_id: &str) -> Result<Vec<RunningTaskInfo>> {
-        // Collect all the running task need to cancel when there are running stages rolled back.
+    /// Returns the running tasks that need to be cancelled (their vcores were
+    /// captured before rollback dropped `task_infos`) and any jobs the
+    /// adaptive graph failed because it cannot re-run a finalised stage.
+    pub async fn executor_lost(&self, executor_id: &str) -> Result<ExecutorLostOutcome> {
         let mut running_tasks_to_cancel: Vec<RunningTaskInfo> = vec![];
+        let mut failed_jobs: Vec<(JobId, u64, String)> = vec![];
 
         {
             for pairs in self.active_job_cache.iter() {
-                let (_job_id, job_info) = pairs.pair();
+                let (job_id, job_info) = pairs.pair();
                 let mut graph = job_info.execution_graph.write().await;
                 let reset = graph.reset_stages_on_lost_executor(executor_id)?;
                 if !reset.0.is_empty() {
                     running_tasks_to_cancel.extend(reset.1);
                 }
+                if let Some(job_status::Status::Failed(failed)) = &graph.status().status
+                    && failed.error.contains(ballista_core::AQE_EXECUTOR_LOSS_MARKER)
+                {
+                    failed_jobs.push((
+                        job_id.clone(),
+                        failed.queued_at,
+                        failed.error.clone(),
+                    ));
+                }
             }
         }
 
-        Ok(running_tasks_to_cancel)
+        Ok(ExecutorLostOutcome {
+            tasks_to_cancel: running_tasks_to_cancel,
+            failed_jobs,
+        })
     }
 
     /// Retrieves the number of available tasks for the given job.

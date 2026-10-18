@@ -125,6 +125,18 @@ impl ExecutionStage {
         }
     }
 
+    /// Stage attempt of whichever variant this is. Bumped when a running
+    /// stage rolls back to unresolved.
+    pub fn stage_attempt_num(&self) -> usize {
+        match self {
+            ExecutionStage::UnResolved(stage) => stage.stage_attempt_num,
+            ExecutionStage::Resolved(stage) => stage.stage_attempt_num,
+            ExecutionStage::Running(stage) => stage.stage_attempt_num,
+            ExecutionStage::Successful(stage) => stage.stage_attempt_num,
+            ExecutionStage::Failed(stage) => stage.stage_attempt_num,
+        }
+    }
+
     /// TaskInfos indexed by task_id (the append-order slot) for stages
     /// that have started binding tasks. Returns `None` for
     /// UnResolved/Resolved stages that haven't bound anything yet.

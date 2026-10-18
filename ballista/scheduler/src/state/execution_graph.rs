@@ -270,6 +270,30 @@ pub trait ExecutionGraph: Debug {
             .map(|ti| ti.vcores_consumed)
     }
 
+    /// Vcores to refund for a *late* status update. A rollback drops
+    /// `task_infos` (the stage is `UnResolved`) and bumps
+    /// `stage_attempt_num` when it runs again, so a `TaskKilled` from the
+    /// previous attempt must not refund a vcore the new attempt already
+    /// holds — or a vcore already refunded at rollback time.
+    fn task_vcores_for_attempt(
+        &self,
+        stage_id: usize,
+        stage_attempt_num: usize,
+        task_id: usize,
+    ) -> Option<u32> {
+        let stage = self.stages().get(&stage_id)?;
+        if !matches!(stage, ExecutionStage::Running(_)) {
+            return None;
+        }
+        if stage.stage_attempt_num() != stage_attempt_num {
+            return None;
+        }
+        stage
+            .task_infos()
+            .and_then(|infos| infos.get(task_id))
+            .map(|ti| ti.vcores_consumed)
+    }
+
     /// returns next task to run
     /// (used for testing only)
     #[cfg(test)]
@@ -332,6 +356,35 @@ pub struct RunningTaskInfo {
     pub stage_id: usize,
     /// The executor ID where this task is running.
     pub executor_id: String,
+    /// Vcores this task held on `executor_id` at bind time. Captured before
+    /// a rollback drops `task_infos`, so the scheduler can refund the
+    /// survivor's budget immediately (M7.4).
+    pub vcores_consumed: u32,
+}
+
+impl RunningTaskInfo {
+    /// Build from a still-running stage, reading `vcores_consumed` off the
+    /// task slot before any rollback drops `task_infos`.
+    pub(crate) fn from_running(
+        job_id: JobId,
+        stage: &crate::state::execution_stage::RunningStage,
+        task_id: usize,
+        stage_id: usize,
+        executor_id: String,
+    ) -> Self {
+        let vcores_consumed = stage
+            .task_infos
+            .get(task_id)
+            .map(|info| info.vcores_consumed)
+            .unwrap_or(0);
+        Self {
+            task_id,
+            job_id,
+            stage_id,
+            executor_id,
+            vcores_consumed,
+        }
+    }
 }
 
 impl StaticExecutionGraph {
@@ -1214,15 +1267,17 @@ impl ExecutionGraph for StaticExecutionGraph {
             .values()
             .flat_map(|stage| {
                 if let ExecutionStage::Running(stage) = stage {
-                    stage
-                        .running_tasks()
-                        .into_iter()
-                        .map(|(task_id, stage_id, executor_id)| RunningTaskInfo {
-                            task_id,
-                            job_id: self.job_id.clone(),
-                            stage_id,
-                            executor_id,
-                        })
+                    stage.running_tasks().into_iter().map(
+                        |(task_id, stage_id, executor_id)| {
+                            RunningTaskInfo::from_running(
+                                self.job_id.clone(),
+                                stage,
+                                task_id,
+                                stage_id,
+                                executor_id,
+                            )
+                        },
+                    )
                         .collect::<Vec<RunningTaskInfo>>()
                 } else {
                     vec![]
@@ -1364,11 +1419,14 @@ impl ExecutionGraph for StaticExecutionGraph {
             let running_tasks = stage
                 .running_tasks()
                 .into_iter()
-                .map(|(task_id, stage_id, executor_id)| RunningTaskInfo {
-                    task_id,
-                    job_id: self.job_id.clone(),
-                    stage_id,
-                    executor_id,
+                .map(|(task_id, stage_id, executor_id)| {
+                    RunningTaskInfo::from_running(
+                        self.job_id.clone(),
+                        stage,
+                        task_id,
+                        stage_id,
+                        executor_id,
+                    )
                 })
                 .collect();
             let unresolved_stage = stage.to_unresolved(failure_reasons)?;
